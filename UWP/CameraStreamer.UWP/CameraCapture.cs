@@ -1,5 +1,6 @@
 ﻿//Project: CameraCaptureStreamer.UWP
 //Filename: CameraCapture.cs
+//Version: 20170907
 
 using System.Collections.Generic;
 using Windows.Graphics.Imaging;
@@ -42,7 +43,17 @@ namespace Chantzaras.Media.Capture
             while (true)
             {
                 if ((stop != null) && stop())
+                {
+                    //cleanup
+                    _mediaCapture.StopPreviewAsync().GetAwaiter().GetResult();
+                    _mediaCapture = null;
+                    previewControl.Dispatcher.TryRunAsync(CoreDispatcherPriority.Normal, () =>
+                    {
+                        previewControl.Source = null;
+                    }).GetAwaiter().GetResult();
+
                     yield break;
+                }
 
                 yield return CameraImage(previewControl, width, height);
             }
