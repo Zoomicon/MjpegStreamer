@@ -1,6 +1,6 @@
 ﻿//Project: MjpegStreamer.UWP
 //Filename: MjpegStreamer.cs
-//Version: 20170907
+//Version: 20170913
 
 using System;
 using System.Collections.Generic;
@@ -9,6 +9,7 @@ using System.Threading.Tasks;
 using System.Threading;
 using Windows.Networking.Sockets;
 using System.IO; //for WindowsRuntimeStreamExtensions - see https://msdn.microsoft.com/en-us/library/system.io.windowsruntimestreamextensions(v=vs.110).aspx 
+using Chantzaras.Tasks;
 
 namespace Chantzaras.Media.Streaming.Mjpeg
 {
@@ -17,20 +18,17 @@ namespace Chantzaras.Media.Streaming.Mjpeg
     /// Provides a streaming server that can be used to stream any images source
     /// to any client.
     /// </summary>
-    public class MjpegStreamer : IDisposable, IImageStreamer
+    public class MjpegStreamer : IImageStreamer, IDisposable
     {
-        private Task _Task;
-        private List<StreamSocket> _Clients;
+        public const int DEFAULT_INTERVAL = 50;
 
-        private CancellationTokenSource tokenSource = new CancellationTokenSource();
-        private CancellationToken ct;
+        private StreamSocketListener socketListener;
+        private List<StreamSocket> _Clients = new List<StreamSocket>();
 
         public MjpegStreamer(IEnumerable<SoftwareBitmap> imagesSource)
         {
-            _Clients = new List<StreamSocket>();
-
-            this.ImagesSource = imagesSource;
-            this.Interval = 50;
+            ImagesSource = imagesSource;
+            Interval = DEFAULT_INTERVAL;
         }
 
         /// <summary>
@@ -54,21 +52,7 @@ namespace Chantzaras.Media.Streaming.Mjpeg
         /// Returns the status of the server. True means the server is currently 
         /// running and ready to serve any client requests.
         /// </summary>
-        public bool IsRunning { get { return (_Task != null && _Task.Status == TaskStatus.Running); } }
-
-        /// <summary>
-        /// Starts the server to accepts any new connections on the specified port.
-        /// </summary>
-        /// <param name="port"></param>
-        public void Start(int port)
-        {
-            lock (this)
-            {
-                ct = tokenSource.Token;
-                ActionItem.Schedule(ServerTask, port);
-            }
-
-        }
+        public bool IsRunning { get; private set; }
 
         /// <summary>
         /// Starts the server to accepts any new connections on the default port (8080).
@@ -78,39 +62,46 @@ namespace Chantzaras.Media.Streaming.Mjpeg
             this.Start(8080);
         }
 
+        /// <summary>
+        /// Starts the server to accepts any new connections on the specified port.
+        /// </summary>
+        /// <param name="port"></param>
+        public void Start(int port)
+        {
+            lock (this) //TODO: check if lock is needed
+            {
+                ActionItem.Schedule(ServerTask, port);
+            }
+
+        }
+
         public void Stop()
         {
+            if (!IsRunning) return;
 
-            if (this.IsRunning)
+            try
             {
-                try
+                DisposeSocketListener();
+            }
+            finally
+            {
+                lock (_Clients)
                 {
-                    _Task.Wait(); //see https://docs.microsoft.com/en-us/dotnet/standard/parallel-programming/attached-and-detached-child-tasks
-                    tokenSource.Cancel(); //see https://docs.microsoft.com/en-us/dotnet/standard/parallel-programming/task-cancellation and https://stackoverflow.com/questions/4359910/is-it-possible-to-abort-a-task-like-aborting-a-thread-thread-abort-method
-                }
-                finally
-                {
-
-                    lock (_Clients)
+                    foreach (var s in _Clients)
                     {
-
-                        foreach (var s in _Clients)
+                        try
                         {
-                            try
-                            {
-                                s.Dispose();
-                            }
-                            catch (Exception e)
-                            {
-                                System.Diagnostics.Debug.WriteLine(e.Message);
-                            }
+                            s.Dispose();
                         }
-                        _Clients.Clear();
-
+                        catch (Exception e)
+                        {
+                            System.Diagnostics.Debug.WriteLine(e.Message);
+                        }
                     }
-
-                    _Task = null;
+                    _Clients.Clear();
                 }
+
+                IsRunning = false;
             }
         }
 
@@ -119,35 +110,43 @@ namespace Chantzaras.Media.Streaming.Mjpeg
         /// connections from clients.
         /// </summary>
         /// <param name="state"></param>
-        private void ServerTask(object state)
+        private void ServerTask(object port)
         {
 
             try
             {
+                DisposeSocketListener();
+                
                 //Create a StreamSocketListener to start listening for TCP connections.
-                StreamSocketListener socketListener = new StreamSocketListener();
+                socketListener = new StreamSocketListener();
 
                 //Hook up an event handler to call when connections are received.
                 socketListener.ConnectionReceived += SocketListener_ConnectionReceived;
 
                 //Start listening for incoming TCP connections on the specified port. You can specify any port that's not currently in use.
-                socketListener.BindServiceNameAsync(state.ToString()).GetAwaiter().GetResult();
+                socketListener.BindServiceNameAsync(port.ToString()).GetAwaiter().GetResult();
                 //socketListener.BindServiceNameAsync(state.ToString(), SocketProtectionLevel.PlainSocket, GetIPadapter()).GetAwaiter().GetResult();
 
-                System.Diagnostics.Debug.WriteLine(string.Format("Server started on port {0}.", state));
+                IsRunning = true;
+
+                System.Diagnostics.Debug.WriteLine(string.Format("Server started on port {0}.", port));
             }
             catch (Exception e)
             {
+                IsRunning = false;
+
                 System.Diagnostics.Debug.WriteLine(e.Message);
             }
 
-            //this.Stop();
         }
 
+        /// <summary>
+        /// Handles new client connections.
+        /// </summary>
+        /// <param name="client"></param>
         private void SocketListener_ConnectionReceived(StreamSocketListener sender, StreamSocketListenerConnectionReceivedEventArgs args)
         {
             ActionItem.Schedule(ClientTask, args.Socket);
-
         }
 
         /// <summary>
@@ -156,12 +155,11 @@ namespace Chantzaras.Media.Streaming.Mjpeg
         /// <param name="client"></param>
         private void ClientTask(object client)
         {
-
             StreamSocket socket = (StreamSocket)client;
 
             System.Diagnostics.Debug.WriteLine(string.Format("New client from {0}", socket.Information.RemoteAddress.ToString()));
 
-            lock (_Clients)
+            lock (_Clients) //TODO: see if needed, Add may be thread-safe already
                 _Clients.Add(socket);
 
             try
@@ -189,29 +187,32 @@ namespace Chantzaras.Media.Streaming.Mjpeg
             }
             finally
             {
-                lock (_Clients)
+                socket.Dispose();
+
+                lock (_Clients) //TODO: see if needed, Remove may be thread-safe already
                     _Clients.Remove(socket);
             }
         }
 
 
-        #region IDisposable Members
+        #region Cleanup
 
-        public void Dispose()
+        private void DisposeSocketListener()
         {
-            this.Stop();
+            if (socketListener != null)
+            {
+                socketListener.CancelIOAsync().GetAwaiter().GetResult();
+                socketListener.Dispose();
+                socketListener = null;
+            }
+        }
+
+        public void Dispose() //IDisposable
+        {
+            Stop();
         }
 
         #endregion
-    }
-
-    static class ActionItem //see https://github.com/dstuckims/azure-relay-dotnet/commit/93777a9f8563bbdacc4b854afd9fb21a968196b9
-    {
-        public static Task Schedule(Action<object> action, object state, bool attachToParent = false)
-        {
-            // UWP doesn't support ThreadPool[.QueueUserWorkItem] so just use Task.Factory.StartNew
-            return Task.Factory.StartNew(s => action(s), state, (attachToParent) ? TaskCreationOptions.AttachedToParent : TaskCreationOptions.DenyChildAttach);
-        }
     }
 
 }
